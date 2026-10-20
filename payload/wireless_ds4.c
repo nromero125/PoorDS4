@@ -976,6 +976,33 @@ game_bridge_find_slot(GamePadBridgeArgs *args, int32_t handle)
     return -1;
 }
 
+/* Fail-closed DS4 delivery gate (BUG-DS4-AMBOS-JUGADORES).
+ * The installer-selected DualSense slot never receives DS4 frames. A slot may
+ * receive them only if it is an explicit simulated slot, owns its own
+ * published feed, or is the selected target: the exact installer handle or a
+ * regenerated handle whose low byte is the validated target index
+ * (reserved0). Anything else, such as an auto-bound unknown handle, gets
+ * native passthrough. Must stay position independent (copied into game). */
+static __attribute__((always_inline)) inline int
+game_bridge_ds4_target_allowed(GamePadBridgeArgs *args, unsigned slot,
+                               int32_t handle)
+{
+    if (!args || slot >= POORDS4_MAX_SLOTS)
+        return 0;
+    if (args->slots[slot].is_dualsense)
+        return 0;
+    if (args->slots[slot].is_simulated)
+        return 1;
+    if (__atomic_load_n(&args->slots[slot].direct_packets, __ATOMIC_ACQUIRE) != 0)
+        return 1;
+    if (args->pad_handle > 0 && handle == args->pad_handle)
+        return 1;
+    int32_t target_index = (int32_t)args->reserved0;
+    return handle > 0 && (handle & 0xffffff00) != 0 &&
+           target_index >= 0 && target_index < 24 &&
+           (handle & 0xff) == target_index;
+}
+
 static __attribute__((always_inline)) inline int
 game_bridge_direct_available_slot(GamePadBridgeArgs *args, unsigned slot)
 {
@@ -1351,7 +1378,8 @@ game_pad_read_state_stub(int32_t handle, void *out,
             }
             final_result = native_called ? native_result :
                 (original ? original(handle, out, 0) : native_result);
-        } else if (game_bridge_direct_available_slot(args, (unsigned)slot)) {
+        } else if (game_bridge_ds4_target_allowed(args, (unsigned)slot, handle) &&
+                   game_bridge_direct_available_slot(args, (unsigned)slot)) {
             if (original) {
                 native_result = original(handle, out, 0);
                 native_called = 1;
@@ -1468,7 +1496,8 @@ game_pad_read_state_ext_stub(int32_t handle, void *out,
             final_result = native_called ? native_result :
                 (original_ext ? original_ext(handle, out) :
                  (fallback_internal ? fallback_internal(handle, out, 1) : native_result));
-        } else if (game_bridge_direct_available_slot(args, (unsigned)slot)) {
+        } else if (game_bridge_ds4_target_allowed(args, (unsigned)slot, handle) &&
+                   game_bridge_direct_available_slot(args, (unsigned)slot)) {
             if (original_ext) {
                 native_result = original_ext(handle, out);
                 native_called = 1;
@@ -1583,7 +1612,8 @@ game_pad_read_stub(int32_t handle, void *out, int32_t num,
             }
             final_result = native_called ? native_result :
                 (original ? original(handle, out, num, 0) : native_result);
-        } else if (game_bridge_direct_available_slot(args, (unsigned)slot)) {
+        } else if (game_bridge_ds4_target_allowed(args, (unsigned)slot, handle) &&
+                   game_bridge_direct_available_slot(args, (unsigned)slot)) {
             if (original) {
                 native_result = original(handle, out, num, 0);
                 native_called = 1;
@@ -1727,7 +1757,8 @@ game_pad_read_ext_stub(int32_t handle, void *out, int32_t num,
             final_result = native_called ? native_result :
                 (original_ext ? original_ext(handle, out, num) :
                  (fallback_internal ? fallback_internal(handle, out, num, 1) : native_result));
-        } else if (game_bridge_direct_available_slot(args, (unsigned)slot)) {
+        } else if (game_bridge_ds4_target_allowed(args, (unsigned)slot, handle) &&
+                   game_bridge_direct_available_slot(args, (unsigned)slot)) {
             if (original_ext) {
                 native_result = original_ext(handle, out, num);
                 native_called = 1;
@@ -1869,7 +1900,8 @@ game_pad_get_data_internal_stub(int32_t handle, void *out,
             }
             final_result = native_called ? native_result :
                 (original ? original(handle, out, 1) : native_result);
-        } else if (game_bridge_direct_available_slot(args, (unsigned)slot)) {
+        } else if (game_bridge_ds4_target_allowed(args, (unsigned)slot, handle) &&
+                   game_bridge_direct_available_slot(args, (unsigned)slot)) {
             if (original) {
                 native_result = original(handle, out, 1);
                 native_called = 1;
@@ -1970,6 +2002,7 @@ game_pad_get_controller_info_stub(int32_t handle, void *out,
         args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         matched && out &&
         !args->slots[slot].is_dualsense &&
+        game_bridge_ds4_target_allowed(args, (unsigned)slot, handle) &&
         game_bridge_direct_available_slot(args, (unsigned)slot)) {
         volatile uint8_t *info = (volatile uint8_t *)out;
         uint16_t touch_x = (uint16_t)info[4] |
@@ -2043,6 +2076,7 @@ game_pad_get_ext_controller_info_stub(int32_t handle, void *out,
         args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         matched && out &&
         !args->slots[slot].is_dualsense &&
+        game_bridge_ds4_target_allowed(args, (unsigned)slot, handle) &&
         game_bridge_direct_available_slot(args, (unsigned)slot)) {
         volatile uint8_t *info = (volatile uint8_t *)out;
         uint16_t touch_x = (uint16_t)info[4] |
@@ -5695,6 +5729,67 @@ wireless_ds4_game_bridge_quiesce(pid_t game_pid, intptr_t args_kaddr)
 #endif
 }
 
+#if defined(__PROSPERO__)
+/* BUG-DS4-AMBOS-JUGADORES: the legacy single-DS4 publisher always targets
+ * slot 0 with is_dualsense=0. When P1 is a connected DualSense in table slot 0
+ * and the DS4 target is slot 1, that publication overwrote the installer's
+ * slot 0 identity (is_dualsense=1 -> 0, active -> 1), so every P1 read took
+ * the direct branch and received DS4 frames alongside P2. The installer's
+ * identity flag is authoritative: capture it once per bridge instance before
+ * the supervisor first writes a slot, and never publish over it. */
+static pid_t g_game_bridge_identity_pid = -1;
+static intptr_t g_game_bridge_identity_args = 0;
+static int8_t g_game_bridge_slot_identity[POORDS4_MAX_SLOTS] = {-1, -1, -1, -1};
+static uint32_t g_game_bridge_identity_suppressed[POORDS4_MAX_SLOTS] = {0};
+
+/* Returns 1 if the installer marked slot_idx as the native DualSense, 0 if not,
+ * -1 if unknown (read failed): callers must treat unknown as "do not touch". */
+static int
+game_bridge_slot_installed_dualsense(pid_t game_pid, intptr_t args_kaddr,
+                                     unsigned slot_idx)
+{
+    if (slot_idx >= POORDS4_MAX_SLOTS)
+        return -1;
+    if (game_pid != g_game_bridge_identity_pid ||
+        args_kaddr != g_game_bridge_identity_args) {
+        g_game_bridge_identity_pid = game_pid;
+        g_game_bridge_identity_args = args_kaddr;
+        for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
+            g_game_bridge_slot_identity[s] = -1;
+            g_game_bridge_identity_suppressed[s] = 0;
+        }
+    }
+    if (g_game_bridge_slot_identity[slot_idx] < 0) {
+        uint32_t installed = 0;
+        intptr_t address = args_kaddr +
+            (intptr_t)offsetof(GamePadBridgeArgs, slots) +
+            (intptr_t)slot_idx * (intptr_t)sizeof(GamePadBridgeSlot) +
+            (intptr_t)offsetof(GamePadBridgeSlot, is_dualsense);
+        if (game_bridge_process_read(game_pid, address, &installed,
+                                     sizeof(installed)) != 0) {
+            klog_printf("[PoorDS4] slot identity read failed pid=%d slot=%u; "
+                        "slot left untouched\n", game_pid, slot_idx);
+            return -1;
+        }
+        g_game_bridge_slot_identity[slot_idx] = installed ? 1 : 0;
+        klog_printf("[PoorDS4] slot identity pid=%d slot=%u installed_dualsense=%u\n",
+                    game_pid, slot_idx, installed ? 1u : 0u);
+    }
+    return g_game_bridge_slot_identity[slot_idx];
+}
+
+static void
+game_bridge_note_identity_suppressed(pid_t game_pid, unsigned slot_idx,
+                                     int identity)
+{
+    uint32_t count = ++g_game_bridge_identity_suppressed[slot_idx];
+    if (count == 1u || (count & 0xfffu) == 0u)
+        klog_printf("[PoorDS4] DS4 publication kept off slot=%u pid=%d "
+                    "identity=%s count=%u\n", slot_idx, game_pid,
+                    identity > 0 ? "dualsense" : "unknown", count);
+}
+#endif
+
 int
 wireless_ds4_game_bridge_update_slot(pid_t game_pid, intptr_t args_kaddr,
                                      unsigned slot_idx, const void *pad_data,
@@ -5728,13 +5823,31 @@ wireless_ds4_game_bridge_update_slot(pid_t game_pid, intptr_t args_kaddr,
         next_seq = 1;
     uint32_t buffer_idx = next_seq & 1u;
 
+    /* Fail-closed: a DS4 (non-DualSense) publication must never overwrite the
+     * installer's DualSense slot, nor a slot whose identity cannot be read.
+     * Slot 0 is the legacy single-DS4 feed: there the DS4 frame still goes to
+     * the legacy args->direct_* buffer, which the selected target slot
+     * consumes, but slot 0's own record (and P1's identity) stays intact. */
+    int write_slot_record = 1;
+    if (!is_dualsense) {
+        int identity = game_bridge_slot_installed_dualsense(
+            game_pid, args_kaddr, slot_idx);
+        if (identity != 0) {
+            game_bridge_note_identity_suppressed(game_pid, slot_idx, identity);
+            if (slot_idx != 0)
+                return -1;
+            write_slot_record = 0;
+        }
+    }
+
     intptr_t slot_base = args_kaddr + (intptr_t)offsetof(GamePadBridgeArgs, slots) +
         (intptr_t)slot_idx * (intptr_t)sizeof(GamePadBridgeSlot);
     intptr_t frame_address = slot_base +
         (intptr_t)offsetof(GamePadBridgeSlot, direct_pad_data) +
         (intptr_t)buffer_idx * POORDS4_GAME_BRIDGE_PAD_SIZE;
 
-    if (game_bridge_process_write(
+    if (write_slot_record &&
+        game_bridge_process_write(
             game_pid, frame_address, pad_data,
             POORDS4_GAME_BRIDGE_PAD_SIZE) != 0)
         return -1;
@@ -5754,7 +5867,8 @@ wireless_ds4_game_bridge_update_slot(pid_t game_pid, intptr_t args_kaddr,
     slot_pub.direct_lease = POORDS4_GAME_BRIDGE_DIRECT_LEASE;
     slot_pub.direct_packets = g_game_bridge_slot_packets[slot_idx] + 1u;
 
-    if (game_bridge_process_write(
+    if (write_slot_record &&
+        game_bridge_process_write(
             game_pid,
             slot_base + (intptr_t)offsetof(GamePadBridgeSlot, active),
             &slot_pub, sizeof(slot_pub)) != 0)
@@ -5812,7 +5926,12 @@ wireless_ds4_game_bridge_deactivate_slot(pid_t game_pid, intptr_t args_kaddr,
         uint32_t direct_lease;
     } slot_pub;
     slot_pub.active = 0u;
-    slot_pub.is_dualsense = 0u;
+    /* Deactivation still stops the slot (cleanup invariant), but it must not
+     * erase the installer's DualSense identity, or the next legacy read path
+     * would treat P1 as a DS4 consumer. */
+    slot_pub.is_dualsense =
+        game_bridge_slot_installed_dualsense(game_pid, args_kaddr,
+                                             slot_idx) > 0 ? 1u : 0u;
     slot_pub.is_simulated = 0u;
     slot_pub.direct_seq = 0u;
     slot_pub.direct_lease = 0u;

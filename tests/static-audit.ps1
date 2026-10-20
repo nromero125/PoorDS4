@@ -166,6 +166,51 @@ Assert-True (-not $installer.Contains('pt_call(')) `
 Assert-True (-not $installer.Contains('PT_ATTACH')) `
     'Active game installer contains a game attach operation.'
 
+# BUG-DS4-AMBOS-JUGADORES: DS4 frames must reach only the selected target,
+# never the installer's DualSense slot (P1).
+function Get-Section {
+    param([string]$Text, [string]$Start, [string]$End, [string]$Name)
+    $from = $Text.IndexOf($Start, [StringComparison]::Ordinal)
+    $to = if ($from -ge 0) {
+        $Text.IndexOf($End, $from + $Start.Length, [StringComparison]::Ordinal)
+    } else { -1 }
+    Assert-True ($from -ge 0 -and $to -gt $from) "Could not isolate $Name."
+    return $Text.Substring($from, $to - $from)
+}
+
+Assert-True ([regex]::IsMatch($bridge,
+    'static __attribute__\(\(always_inline\)\) inline int\r?\ngame_bridge_ds4_target_allowed\(')) `
+    'DS4 target gate is missing or lacks its position-independent inline declaration.'
+$gate = Get-Section $bridge 'game_bridge_ds4_target_allowed(GamePadBridgeArgs *args' `
+    'game_bridge_direct_available_slot(GamePadBridgeArgs *args' 'the DS4 target gate'
+$gateDualSense = $gate.IndexOf('args->slots[slot].is_dualsense', [StringComparison]::Ordinal)
+$gateSimulated = $gate.IndexOf('args->slots[slot].is_simulated', [StringComparison]::Ordinal)
+Assert-True ($gateDualSense -ge 0 -and $gateSimulated -gt $gateDualSense) `
+    'DS4 target gate does not reject the DualSense slot before any allow rule.'
+Assert-True ($gate.Contains('(handle & 0xff) == target_index')) `
+    'DS4 target gate does not follow the validated target slot across handle regeneration.'
+$gateUses = [regex]::Matches($bridge,
+    [regex]::Escape('game_bridge_ds4_target_allowed(args, (unsigned)slot, handle) &&')).Count
+Assert-True ($gateUses -eq 7) `
+    "DS4 target gate must guard all 5 read hooks and 2 controller-info hooks (found $gateUses)."
+
+$publisher = Get-Section $bridge 'wireless_ds4_game_bridge_update_slot(pid_t game_pid' `
+    'wireless_ds4_game_bridge_deactivate_slot(pid_t game_pid' 'the slot publisher'
+$identityCheck = $publisher.IndexOf('game_bridge_slot_installed_dualsense(',
+    [StringComparison]::Ordinal)
+$firstWrite = $publisher.IndexOf('game_bridge_process_write(', [StringComparison]::Ordinal)
+Assert-True ($identityCheck -ge 0 -and $firstWrite -gt $identityCheck) `
+    'Slot publisher writes game memory before checking the installer DualSense identity.'
+Assert-True ([regex]::Matches($publisher, [regex]::Escape('write_slot_record &&')).Count -eq 2) `
+    'Slot publisher does not gate both the frame and the slot record writes.'
+
+$deactivate = Get-Section $bridge 'wireless_ds4_game_bridge_deactivate_slot(pid_t game_pid' `
+    'wireless_ds4_game_bridge_update(pid_t game_pid' 'slot deactivation'
+Assert-True (-not $deactivate.Contains('slot_pub.is_dualsense = 0u;')) `
+    'Slot deactivation still erases the installer DualSense identity.'
+Assert-True ($deactivate.Contains('slot_pub.active = 0u;')) `
+    'Slot deactivation no longer stops the slot.'
+
 $tracked = & git -C $repo ls-files
 if ($LASTEXITCODE -ne 0) {
     throw 'git ls-files failed.'
